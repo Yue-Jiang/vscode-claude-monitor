@@ -196,6 +196,21 @@ local function refreshWindows()
   end
 end
 
+-- ====================== focus helper ======================
+
+-- Brings a window properly to the front, including switching apps if needed.
+-- `win:focus()` alone only focuses within the window's app; if that app isn't
+-- frontmost (e.g. restoring focus from VS Code back to Slack), the window
+-- doesn't actually become visible. Activate the app first.
+local function focusWindow(win)
+  if not win then return end
+  pcall(function()
+    local app = win:application()
+    if app then app:activate() end
+    win:focus()
+  end)
+end
+
 -- ====================== menubar ======================
 
 local function rebuildMenu()
@@ -214,7 +229,13 @@ local function rebuildMenu()
     local hk = w.slot and ("⌃⌥" .. w.slot) or "    "
     local title = string.format("%s  %s  %s", dot, hk, w.workspace)
     if w.promptTitle then title = title .. "  —  " .. w.promptTitle end
-    table.insert(entries, { title = title, fn = function() w.win:focus() end })
+    -- Defer the focus call so it runs after macOS dismisses the menu;
+    -- otherwise the focus change races with the menu dismissal and is lost.
+    local target = w
+    table.insert(entries, {
+      title = title,
+      fn = function() hs.timer.doAfter(0, function() focusWindow(target.win) end) end,
+    })
   end
   if #entries == 0 then
     table.insert(entries, { title = "(no VS Code windows)", disabled = true })
@@ -270,7 +291,7 @@ end
 
 local function focusBySlot(slot)
   for _, w in pairs(windows) do
-    if w.slot == slot then w.win:focus(); return end
+    if w.slot == slot then focusWindow(w.win); return end
   end
 end
 
@@ -304,13 +325,19 @@ local function smartCycleWaiting()
       cycleState.previousFocus = current
       target = waiting[1]
     end
-    target.win:focus()
+    print(string.format("[vscode_attention] cycle: %s -> %s (prev saved: %s)",
+      current and current:title():sub(1, 30) or "nil",
+      target.win:title():sub(1, 30),
+      tostring(idx == nil)))
+    focusWindow(target.win)
     return
   end
 
   -- No waiting windows. End-of-cycle restore takes precedence over cold-press.
   if cycleState.previousFocus then
-    pcall(function() cycleState.previousFocus:focus() end)
+    print(string.format("[vscode_attention] restore -> %s",
+      cycleState.previousFocus:title():sub(1, 40)))
+    focusWindow(cycleState.previousFocus)
     cycleState.previousFocus = nil
     return
   end
@@ -321,7 +348,7 @@ local function smartCycleWaiting()
   if app and app:name() == "Code" then return end
   for _, w in ipairs(hs.window.orderedWindows()) do
     local a = w:application()
-    if a and a:name() == "Code" then w:focus(); return end
+    if a and a:name() == "Code" then focusWindow(w); return end
   end
 end
 
