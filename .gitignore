@@ -1,0 +1,5 @@
+# Runtime state — workspace→slot mapping is user-specific
+vscode_attention_state.json
+
+# macOS
+.DS_Store
