@@ -72,29 +72,82 @@ end
 
 -- ====================== detection ======================
 
-local function findMarker(root, maxDepth)
-  if not root then return nil end
+-- Walks the panel subtree once, looking for BOTH the formal-prompt marker
+-- and a sign that Claude's last message ended with a question.
+-- Marker takes priority and early-terminates the walk.
+--
+-- Question detection: collect all AXStaticText fragments in DFS order, find
+-- the last occurrence of the input-area placeholder ("Esc to focus or unfocus
+-- Claude") as an end-of-chat sentinel, then walk backwards. The first
+-- substantial fragment we encounter is Claude's trailing text — if it ends
+-- with "?", flag as question; if not, the last message wasn't a question
+-- (even if older messages had questions in them).
+local CHAT_END_SENTINEL = "Esc to focus or unfocus Claude"
+local MIN_SUBSTANTIAL = 8
+
+local function cleanQuestion(s)
+  return (s:gsub("^[%s%p]+", "")
+           :gsub("^\xE2\x80[\x93\x94]%s*", "")
+           :gsub("^[%s%p]+", ""))
+end
+
+-- Returns marker (or nil), question text (or nil), and an anchor AX element
+-- the caller can climb to find a stable cache root (AXWebArea). The anchor
+-- is the marker if found, else the sentinel element if found, else nil.
+local function scanPanel(root, maxDepth)
+  if not root then return nil, nil, nil end
+  local marker = nil
+  local items = {}  -- list of { value, element } in DFS order
   local function walk(el, depth)
-    if depth > maxDepth then return nil end
+    if depth > maxDepth or marker then return end
     local v = el:attributeValue("AXValue")
-    if v == CONFIG.axMarker then return el end
+    if v == CONFIG.axMarker then marker = el; return end
+    if type(v) == "string" and #v >= 1 then
+      table.insert(items, { value = v, element = el })
+    end
     local children = el:attributeValue("AXChildren")
     if children then
       for _, c in ipairs(children) do
-        local hit = walk(c, depth + 1)
-        if hit then return hit end
+        walk(c, depth + 1)
+        if marker then return end
       end
     end
-    return nil
   end
-  return walk(root, 0)
+  walk(root, 0)
+  if marker then return marker, nil, marker end
+
+  local sentinelIdx
+  for i = #items, 1, -1 do
+    if items[i].value:find(CHAT_END_SENTINEL, 1, true) then sentinelIdx = i; break end
+  end
+  if not sentinelIdx then return nil, nil, nil end
+  local anchor = items[sentinelIdx].element
+
+  -- Skip consecutive sentinel duplicates (placeholder + a11y label render twice).
+  while sentinelIdx > 1 and items[sentinelIdx - 1].value:find(CHAT_END_SENTINEL, 1, true) do
+    sentinelIdx = sentinelIdx - 1
+  end
+
+  for i = sentinelIdx - 1, math.max(1, sentinelIdx - 20), -1 do
+    local t = items[i].value
+    if #t >= MIN_SUBSTANTIAL then
+      if t:match("%?%s*$") then return nil, cleanQuestion(t), anchor end
+      return nil, nil, anchor
+    end
+  end
+  return nil, nil, anchor
 end
 
-local function climb(el, levels)
-  for _ = 1, levels do
-    local p = el and el:attributeValue("AXParent")
-    if not p then return el end
-    el = p
+-- Climb the tree from `el` until we hit an AXWebArea (Claude Code's panel is
+-- inside one), or give up after maxLevels. Using AXWebArea as the cache anchor
+-- ensures the cached subtree contains the entire panel — old prompt content,
+-- new messages, and the input area — so checks stay accurate as the
+-- conversation grows.
+local function climbToWebArea(el, maxLevels)
+  for _ = 1, maxLevels or 15 do
+    if not el then return nil end
+    if el:attributeValue("AXRole") == "AXWebArea" then return el end
+    el = el:attributeValue("AXParent")
   end
   return el
 end
@@ -125,7 +178,7 @@ local function extractPromptTitle(marker)
 end
 
 -- Check using the cached panel-root subtree (fast).
--- Returns "waiting"|"idle"|"no_cache"|"cache_invalid", promptTitle.
+-- Returns "waiting"|"question"|"idle"|"no_cache"|"cache_invalid", title.
 local function fastCheck(state)
   if not state.panelRoot then return "no_cache", nil end
   local ok, role = pcall(function() return state.panelRoot:attributeValue("AXRole") end)
@@ -133,21 +186,23 @@ local function fastCheck(state)
     state.panelRoot = nil
     return "cache_invalid", nil
   end
-  local marker = findMarker(state.panelRoot, CONFIG.walkMaxDepth)
+  local marker, lastQuestion = scanPanel(state.panelRoot, CONFIG.walkMaxDepth)
   if marker then return "waiting", extractPromptTitle(marker) end
+  if lastQuestion then return "question", lastQuestion end
   return "idle", nil
 end
 
--- Full walk from the window root (slow). Caches a new panel root on hit.
--- Returns "waiting"|"idle", promptTitle.
+-- Full walk from the window root (slow). Caches the panel's AXWebArea so
+-- future polls only walk inside it. Caches even when the result is idle —
+-- as long as the Claude Code panel is visible (sentinel present), we can
+-- pin a cache for fast future detection of new prompts or questions.
 local function slowCheck(state)
   local axwin = hs.axuielement.windowElement(state.win)
   if not axwin then return "idle", nil end
-  local marker = findMarker(axwin, CONFIG.walkMaxDepth)
-  if marker then
-    state.panelRoot = climb(marker, CONFIG.panelRootLevels)
-    return "waiting", extractPromptTitle(marker)
-  end
+  local marker, lastQuestion, anchor = scanPanel(axwin, CONFIG.walkMaxDepth)
+  if anchor then state.panelRoot = climbToWebArea(anchor, 15) end
+  if marker then return "waiting", extractPromptTitle(marker) end
+  if lastQuestion then return "question", lastQuestion end
   return "idle", nil
 end
 
@@ -176,8 +231,8 @@ local function refreshWindows()
     local id = win:id()
     if id then
       seen[id] = true
+      local ws = workspaceFromTitle(win:title())
       if not windows[id] then
-        local ws = workspaceFromTitle(win:title())
         windows[id] = {
           win         = win,
           workspace   = ws or ("window-" .. id),
@@ -188,6 +243,15 @@ local function refreshWindows()
         }
       else
         windows[id].win = win
+        -- Upgrade workspace name if the title has settled into a parseable
+        -- form (e.g. a new window started without a folder and then had one
+        -- opened). Only assign a slot the first time we get a real name.
+        if ws and windows[id].workspace ~= ws then
+          windows[id].workspace = ws
+          if not windows[id].slot then
+            windows[id].slot = assignSlot(ws)
+          end
+        end
       end
     end
   end
@@ -215,7 +279,7 @@ end
 
 local function rebuildMenu()
   if not menubar then return end
-  local anyWaiting = false
+  local anyWaiting, anyQuestion = false, false
   local list = {}
   for _, w in pairs(windows) do table.insert(list, w) end
   table.sort(list, function(a, b) return (a.slot or 99) < (b.slot or 99) end)
@@ -224,6 +288,7 @@ local function rebuildMenu()
   for _, w in ipairs(list) do
     local dot
     if w.state == "waiting" then dot = "●"; anyWaiting = true
+    elseif w.state == "question" then dot = "◐"; anyQuestion = true
     elseif w.state == "idle" then dot = "○"
     else dot = "?" end
     local hk = w.slot and ("⌃⌥" .. w.slot) or "    "
@@ -240,7 +305,10 @@ local function rebuildMenu()
   if #entries == 0 then
     table.insert(entries, { title = "(no VS Code windows)", disabled = true })
   end
-  menubar:setTitle(anyWaiting and "🟠" or "⚪")
+  local icon = "⚪"
+  if anyWaiting then icon = "🟠"
+  elseif anyQuestion then icon = "🟡" end
+  menubar:setTitle(icon)
   menubar:setMenu(entries)
 end
 
@@ -295,13 +363,19 @@ local function focusBySlot(slot)
   end
 end
 
+-- Returns windows needing attention: all "waiting" first (by slot), then all
+-- "question" (by slot). The cycle hotkey walks this list in order.
 local function sortedWaiting()
-  local list = {}
+  local waiting, question = {}, {}
   for _, w in pairs(windows) do
-    if w.state == "waiting" then table.insert(list, w) end
+    if w.state == "waiting" then table.insert(waiting, w)
+    elseif w.state == "question" then table.insert(question, w) end
   end
-  table.sort(list, function(a, b) return (a.slot or 99) < (b.slot or 99) end)
-  return list
+  local function bySlot(a, b) return (a.slot or 99) < (b.slot or 99) end
+  table.sort(waiting, bySlot)
+  table.sort(question, bySlot)
+  for _, w in ipairs(question) do table.insert(waiting, w) end
+  return waiting
 end
 
 -- previousFocus is set when the user starts a cycle (jumps to a waiting window
@@ -374,7 +448,12 @@ end
 
 function M.start()
   loadSlotMap()
-  menubar = hs.menubar.new()
+  -- The second argument is an autosave name. With it, macOS remembers the
+  -- item's position in the menu bar across reloads — without it, Ice (or any
+  -- menubar manager) treats each reload as a brand-new item and resets it
+  -- to the leftmost position (which on notch-MacBooks vanishes behind the
+  -- camera cutout).
+  menubar = hs.menubar.new(true, "vscode_attention")
   enableA11yForCode()
   appWatch = hs.application.watcher.new(function(name, event, _)
     if name == "Code" and
