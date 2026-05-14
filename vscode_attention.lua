@@ -186,8 +186,15 @@ local function fastCheck(state)
     state.panelRoot = nil
     return "cache_invalid", nil
   end
-  local marker, lastQuestion = scanPanel(state.panelRoot, CONFIG.walkMaxDepth)
+  local marker, lastQuestion, anchor = scanPanel(state.panelRoot, CONFIG.walkMaxDepth)
   if marker then return "waiting", extractPromptTitle(marker) end
+  -- If neither the marker nor the input sentinel are reachable from the
+  -- cached subtree, the panel has shifted (re-rendered, scrolled out, etc.).
+  -- Drop the cache and force a fresh slow walk on the next budget turn.
+  if not anchor then
+    state.panelRoot = nil
+    return "cache_invalid", nil
+  end
   if lastQuestion then return "question", lastQuestion end
   return "idle", nil
 end
