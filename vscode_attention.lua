@@ -20,8 +20,14 @@ local CONFIG = {
   hotkeyMods       = { "ctrl", "alt" },
   maxSlots         = 9,
   walkMaxDepth     = 30,
-  panelRootLevels  = 5,
   slowWalksPerTick = 1,
+  -- Maximum age (seconds) of a cached panelRoot before we force a fresh slow
+  -- walk to refresh it. Cached subtrees occasionally become stale: the AX
+  -- reference stays alive but no longer reflects the current panel content
+  -- (e.g. after VS Code re-renders the webview). Without periodic refresh,
+  -- such caches can keep returning "idle" forever even when there's a
+  -- question or prompt to surface.
+  cacheMaxAge      = 60,
 }
 
 local slotMap    = {}
@@ -242,12 +248,13 @@ local function refreshWindows()
       local ws = workspaceFromTitle(win:title())
       if not windows[id] then
         windows[id] = {
-          win         = win,
-          workspace   = ws or ("window-" .. id),
-          slot        = ws and assignSlot(ws) or nil,
-          state       = "unknown",
-          promptTitle = nil,
-          panelRoot   = nil,
+          win          = win,
+          workspace    = ws or ("window-" .. id),
+          slot         = ws and assignSlot(ws) or nil,
+          state        = "unknown",
+          promptTitle  = nil,
+          panelRoot    = nil,
+          lastSlowWalk = 0,
         }
       else
         windows[id].win = win
@@ -347,13 +354,18 @@ local function pollOnce()
     end
   end
 
-  -- Slow walk one uncached window per tick, round-robin.
+  -- Slow walk one window per tick that's either uncached or whose cache has
+  -- aged past cacheMaxAge. Round-robin order so each candidate gets a fair
+  -- turn even when several are stale at once.
   if #list > 0 then
+    local now = hs.timer.absoluteTime() / 1e9
     for _ = 1, #list do
       rrIndex = (rrIndex % #list) + 1
       local w = list[rrIndex]
-      if not w.panelRoot then
+      local stale = (now - (w.lastSlowWalk or 0)) > CONFIG.cacheMaxAge
+      if (not w.panelRoot) or stale then
         local result, title = slowCheck(w)
+        w.lastSlowWalk = now
         applyResult(w, result, title)
         break
       end
