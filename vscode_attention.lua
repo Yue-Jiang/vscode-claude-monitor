@@ -24,12 +24,13 @@ local CONFIG = {
   slowWalksPerTick = 1,
 }
 
-local slotMap   = {}
-local windows   = {}    -- [windowID] = { win, workspace, slot, state, promptTitle, panelRoot }
-local menubar   = nil
-local timer     = nil
-local hotkeys   = {}
-local appWatch  = nil
+local slotMap    = {}
+local windows    = {}   -- [windowID] = { win, workspace, slot, state, promptTitle, panelRoot }
+local menubar    = nil
+local timer      = nil
+local hotkeys    = {}
+local appWatch   = nil
+local sleepWatch = nil
 
 -- ====================== persistence ======================
 
@@ -470,6 +471,25 @@ function M.start()
     end
   end)
   appWatch:start()
+
+  -- After a sleep/wake or screen unlock, force a fresh refresh. SSH
+  -- reconnects and Chromium renderer restarts during sleep can leave the
+  -- polling in a stuck state where `windows` is empty even though VS Code
+  -- is running with multiple windows. Re-applying AXManualAccessibility
+  -- after wake also helps if Chromium dropped it during sleep.
+  sleepWatch = hs.caffeinate.watcher.new(function(event)
+    if event == hs.caffeinate.watcher.systemDidWake
+       or event == hs.caffeinate.watcher.screensDidUnlock then
+      hs.timer.doAfter(2, function()
+        enableA11yForCode()
+        -- Clear caches so the post-wake walks re-pin to current AXWebAreas.
+        for _, w in pairs(windows) do w.panelRoot = nil end
+        pollOnce()
+      end)
+    end
+  end)
+  sleepWatch:start()
+
   bindHotkeys()
   timer = hs.timer.doEvery(CONFIG.pollInterval, pollOnce)
   pollOnce()
