@@ -21,7 +21,7 @@ Click the icon for a dropdown listing every VS Code window with status, hotkey, 
 
 Global hotkeys (configurable):
 
-- `⌃⌥1` … `⌃⌥5` — focus a specific window by its stable workspace slot.
+- `⌃⌥1` … `⌃⌥9` — focus a specific window by its stable workspace slot.
 - `⌃⌥space` — smart cycle:
   - Jump to the next waiting window. After cycling through all waiting, continue through question windows.
   - If you've answered everything and started from another app, drop you back to it.
@@ -79,19 +79,19 @@ Settings live in the `CONFIG` table at the top of `vscode_attention.lua`:
 | `pollInterval` | `1.5` | How often (seconds) to recheck state |
 | `axMarker` | `"Tell Claude what to do instead"` | Text used to detect a formal prompt |
 | `hotkeyMods` | `{"ctrl", "alt"}` | Modifiers for slot hotkeys (and `space`) |
-| `maxSlots` | `5` | Number of hotkey slots |
+| `maxSlots` | `9` | Number of hotkey slots |
 | `walkMaxDepth` | `30` | Max AX tree depth to walk |
 | `slowWalksPerTick` | `1` | How many uncached windows to fully scan per tick |
 
 Other constants near the top (`CHAT_END_SENTINEL`, `MIN_SUBSTANTIAL`) drive question detection; change if Claude Code's UI text shifts.
 
-Slot assignments (workspace name → number `1`–`5`) are persisted in `~/.hammerspoon/vscode_attention_state.json`. Edit the file directly to reassign slots, then `hs.reload()`.
+Slot assignments (workspace name → number `1`–`9`) are persisted in `~/.hammerspoon/vscode_attention_state.json`. Edit the file directly to reassign slots, then `hs.reload()`.
 
 ## Hotkey cheatsheet
 
 | Keys | Action |
 | --- | --- |
-| `⌃⌥1`–`⌃⌥5` | Focus the VS Code window assigned to that slot |
+| `⌃⌥1`–`⌃⌥9` | Focus the VS Code window assigned to that slot |
 | `⌃⌥space` | Smart cycle: waiting windows first, then question windows, then restore previous app — or quick-jump to last VS Code if none |
 
 ## Troubleshooting
