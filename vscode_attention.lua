@@ -55,6 +55,15 @@ end
 
 local function assignSlot(workspace)
   if slotMap[workspace] then return slotMap[workspace] end
+  -- Auto-migrate from the bare-name slot (pre-"@instance" naming scheme) to
+  -- the new keyed slot. Lets old assignments survive the parser change.
+  local bare = workspace:match("^(.+)@[^@]+$")
+  if bare and slotMap[bare] then
+    slotMap[workspace] = slotMap[bare]
+    slotMap[bare] = nil
+    saveSlotMap()
+    return slotMap[workspace]
+  end
   local used = {}
   for _, s in pairs(slotMap) do used[s] = true end
   for i = 1, CONFIG.maxSlots do
@@ -98,11 +107,15 @@ local function cleanQuestion(s)
            :gsub("^[%s%p]+", ""))
 end
 
--- Returns marker (or nil), question text (or nil), and an anchor AX element
--- the caller can climb to find a stable cache root (AXWebArea). The anchor
--- is the marker if found, else the sentinel element if found, else nil.
+-- Returns { state, title, anchor }. Possible states:
+--   "waiting_marker" — formal Yes/No prompt ("Tell Claude what to do instead")
+--   "waiting_askq"   — multi-choice prompt (AskUserQuestion tool, has Submit answers)
+--   "question"       — end-of-conversation question (last message ends with ?)
+--   "idle"           — nothing pending
+-- "title" is the prompt/question text (or nil). "anchor" is an AX element the
+-- caller can climb to find a stable cache root (the panel's AXWebArea).
 local function scanPanel(root, maxDepth)
-  if not root then return nil, nil, nil end
+  if not root then return { state = "idle" } end
   local marker = nil
   local items = {}  -- list of { value, element } in DFS order
   local function walk(el, depth)
@@ -121,16 +134,34 @@ local function scanPanel(root, maxDepth)
     end
   end
   walk(root, 0)
-  if marker then return marker, nil, marker end
+  if marker then
+    return { state = "waiting_marker", marker = marker, anchor = marker }
+  end
 
+  -- Multi-choice AskUserQuestion prompt. "Submit answers" only appears in the
+  -- active prompt UI (not history), so it's a reliable activeness signal.
+  local submitIdx
+  for i = #items, 1, -1 do
+    if items[i].value == "Submit answers" then submitIdx = i; break end
+  end
+  if submitIdx then
+    for i = submitIdx, 1, -1 do
+      if items[i].value == "AskUserQuestion" and items[i + 1] then
+        return { state = "waiting_askq", title = items[i + 1].value, anchor = items[submitIdx].element }
+      end
+    end
+    -- Submit answers seen but couldn't locate question; still treat as waiting.
+    return { state = "waiting_askq", title = nil, anchor = items[submitIdx].element }
+  end
+
+  -- End-of-conversation question via Esc-to-focus sentinel.
   local sentinelIdx
   for i = #items, 1, -1 do
     if items[i].value:find(CHAT_END_SENTINEL, 1, true) then sentinelIdx = i; break end
   end
-  if not sentinelIdx then return nil, nil, nil end
+  if not sentinelIdx then return { state = "idle" } end
   local anchor = items[sentinelIdx].element
 
-  -- Skip consecutive sentinel duplicates (placeholder + a11y label render twice).
   while sentinelIdx > 1 and items[sentinelIdx - 1].value:find(CHAT_END_SENTINEL, 1, true) do
     sentinelIdx = sentinelIdx - 1
   end
@@ -138,11 +169,13 @@ local function scanPanel(root, maxDepth)
   for i = sentinelIdx - 1, math.max(1, sentinelIdx - 20), -1 do
     local t = items[i].value
     if #t >= MIN_SUBSTANTIAL then
-      if t:match("%?%s*$") then return nil, cleanQuestion(t), anchor end
-      return nil, nil, anchor
+      if t:match("%?%s*$") then
+        return { state = "question", title = cleanQuestion(t), anchor = anchor }
+      end
+      return { state = "idle", anchor = anchor }
     end
   end
-  return nil, nil, anchor
+  return { state = "idle", anchor = anchor }
 end
 
 -- Climb the tree from `el` until we hit an AXWebArea (Claude Code's panel is
@@ -184,6 +217,21 @@ local function extractPromptTitle(marker)
   return find(container, 4)
 end
 
+-- Promote scanPanel's structured result to the user-facing state + title.
+-- Computing the title here (rather than in scanPanel) lets scanPanel sit
+-- above extractPromptTitle in the file without a forward reference.
+local function resolveScanResult(r)
+  if r.state == "waiting_marker" then
+    return "waiting", extractPromptTitle(r.marker)
+  elseif r.state == "waiting_askq" then
+    return "waiting", r.title
+  elseif r.state == "question" then
+    return "question", r.title
+  else
+    return "idle", nil
+  end
+end
+
 -- Check using the cached panel-root subtree (fast).
 -- Returns "waiting"|"question"|"idle"|"no_cache"|"cache_invalid", title.
 local function fastCheck(state)
@@ -193,31 +241,26 @@ local function fastCheck(state)
     state.panelRoot = nil
     return "cache_invalid", nil
   end
-  local marker, lastQuestion, anchor = scanPanel(state.panelRoot, CONFIG.walkMaxDepth)
-  if marker then return "waiting", extractPromptTitle(marker) end
-  -- If neither the marker nor the input sentinel are reachable from the
-  -- cached subtree, the panel has shifted (re-rendered, scrolled out, etc.).
-  -- Drop the cache and force a fresh slow walk on the next budget turn.
-  if not anchor then
+  local r = scanPanel(state.panelRoot, CONFIG.walkMaxDepth)
+  -- If we hit "idle" AND no anchor at all, the cache no longer contains any
+  -- recognizable panel landmark — it's stale. Drop and force a fresh walk.
+  if r.state == "idle" and not r.anchor then
     state.panelRoot = nil
     return "cache_invalid", nil
   end
-  if lastQuestion then return "question", lastQuestion end
-  return "idle", nil
+  return resolveScanResult(r)
 end
 
 -- Full walk from the window root (slow). Caches the panel's AXWebArea so
 -- future polls only walk inside it. Caches even when the result is idle —
--- as long as the Claude Code panel is visible (sentinel present), we can
--- pin a cache for fast future detection of new prompts or questions.
+-- as long as the Claude Code panel is visible, we can pin a cache for fast
+-- future detection of new prompts or questions.
 local function slowCheck(state)
   local axwin = hs.axuielement.windowElement(state.win)
   if not axwin then return "idle", nil end
-  local marker, lastQuestion, anchor = scanPanel(axwin, CONFIG.walkMaxDepth)
-  if anchor then state.panelRoot = climbToWebArea(anchor, 15) end
-  if marker then return "waiting", extractPromptTitle(marker) end
-  if lastQuestion then return "question", lastQuestion end
-  return "idle", nil
+  local r = scanPanel(axwin, CONFIG.walkMaxDepth)
+  if r.anchor then state.panelRoot = climbToWebArea(r.anchor, 15) end
+  return resolveScanResult(r)
 end
 
 -- ====================== windows ======================
@@ -226,15 +269,22 @@ end
 --   "tab — workspace [SSH: instance]"
 --   "tab — workspace [SSH: instance] — Untracked"   (git-status suffix)
 --   "tab — workspace"
--- Strategy: capture everything after the first " — ", then truncate at the
--- next " — " (drops trailing git status), then strip "[SSH: ...]".
+-- Strategy: capture everything after the first " — ", truncate at the next
+-- " — " (drops trailing git status), then split off the SSH instance and
+-- append it as "@instance" so the same folder opened on different remotes
+-- gets distinct workspace identifiers (and distinct hotkey slots).
 local function workspaceFromTitle(title)
   if not title then return nil end
-  local rest = title:match(" \xE2\x80\x94 (.+)$")
-  if not rest then return nil end
+  -- Standard format has a "tab — workspace [SSH: instance]" pattern, but
+  -- windows with no file open (Welcome tab, etc.) have just "workspace
+  -- [SSH: instance]" with no leading " — ". Fall back to the whole title.
+  local rest = title:match(" \xE2\x80\x94 (.+)$") or title
   local sep = rest:find(" \xE2\x80\x94 ")
   if sep then rest = rest:sub(1, sep - 1) end
-  return (rest:gsub(" %[SSH:.-%]$", ""))
+  local instance = rest:match(" %[SSH: ([^%]]+)%]$")
+  rest = rest:gsub(" %[SSH:.-%]$", "")
+  if instance then rest = rest .. "@" .. instance end
+  return rest
 end
 
 local function refreshWindows()
